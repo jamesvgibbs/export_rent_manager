@@ -26,21 +26,20 @@ PoolKey = Tuple[str, str, str, str]
 __POOLS: Dict[PoolKey, ThreadedConnectionPool] = {}
 
 
-def table_to_csv(cursor, schema_name, table_name):
-    logging.info(f"Exporting table {schema_name}.{table_name}...")
-    cursor.execute(f"SELECT * FROM {schema_name}.{table_name}")
-
-    result = cursor.fetchall()
-
+def table_to_csv(cursor, schema_name, table_name, batch_size=1000):
+    offset = 0
     csv_file_name = f"{table_name}.csv"
-
-    # Write data to CSV
-    with open(csv_file_name, "w", newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([i[0] for i in cursor.description])  # Write headers
-        writer.writerows(result)  # Write data
-
-    logging.info(f"Table {table_name} exported successfully.")
+    with open(csv_file_name, "w") as f:
+        csv_writer = csv.writer(f)
+        while True:
+            cursor.execute(f"SELECT * FROM {schema_name}.{table_name} LIMIT {batch_size} OFFSET {offset}")
+            rows = cursor.fetchall()
+            if not rows:
+                break
+            if offset == 0:
+                csv_writer.writerow([desc[0] for desc in cursor.description])  # header
+            csv_writer.writerows(rows)
+            offset += batch_size
     return csv_file_name
 
 
@@ -84,7 +83,7 @@ def get_cursor(conn=None, cursor_factory=DictCursor, **kwargs):
             cursor.close()
 
 
-def postgres_to_csv(schema_name):
+def postgres_to_csv(schema_name, zip_files=False, batch_size=1000):
     logging.info(f"Exporting all tables from schema {schema_name}...")
 
     with get_cursor(database=database, user=user, password=password, host=host) as cursor:
@@ -96,22 +95,32 @@ def postgres_to_csv(schema_name):
         total_tables = len(tables)
         logging.info(f"Total tables to export: {total_tables}")
 
-        os.makedirs("csv_files", exist_ok=True)
+        output_folder = "csv_files"
+        os.makedirs(output_folder, exist_ok=True)
 
-        zip_file_name = f"all_{schema_name}_tables.zip"
-        with zipfile.ZipFile(zip_file_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        if zip_files:
+            zip_file_name = f"all_{schema_name}_tables.zip"
+            with zipfile.ZipFile(zip_file_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for i, table in enumerate(tables):
+                    table_name = table[0]
+                    try:
+                        csv_file_name = table_to_csv(cursor, schema_name, table_name, batch_size)
+                        zipf.write(csv_file_name, os.path.join(output_folder, csv_file_name))
+                        os.remove(csv_file_name)
+                        logging.info(f"Progress: {i + 1}/{total_tables} tables exported.")
+                    except Exception as e:
+                        logging.error(f"Failed to export table {table_name}. Error: {e}")
+        else:
             for i, table in enumerate(tables):
                 table_name = table[0]
                 try:
-                    csv_file_name = table_to_csv(cursor, schema_name, table_name)
-                    zipf.write(csv_file_name, os.path.join("csv_files", csv_file_name))
-                    os.remove(csv_file_name)
+                    csv_file_name = table_to_csv(cursor, schema_name, table_name, batch_size)
+                    os.rename(csv_file_name, os.path.join(output_folder, csv_file_name))
                     logging.info(f"Progress: {i + 1}/{total_tables} tables exported.")
                 except Exception as e:
                     logging.error(f"Failed to export table {table_name}. Error: {e}")
 
-        cursor.close()
-        logging.info("All tables exported and zipped.")
+        logging.info("All tables exported.")
 
 
 if __name__ == "__main__":
