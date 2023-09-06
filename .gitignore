@@ -187,3 +187,7 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# No CSV file data
+/csv_files/
+*.csv
