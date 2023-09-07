@@ -4,7 +4,7 @@ import logging
 import boto3
 import glob
 from tqdm import tqdm
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import DictCursor
 from contextlib import contextmanager
@@ -86,27 +86,35 @@ def ensure_bucket_exists(bucket_name, region="us-east-2"):
             exit(1)
 
 
-def table_to_csv(cursor, schema_name, table_name, batch_size=1000):
+def table_to_csv(cursor, schema_name, table_name, batch_size=1000, max_rows_per_shard=200000):
+    generated_files = []
     offset = 0
     total_rows = cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")
     total_rows = cursor.fetchone()[0]
-    pbar = tqdm(total=total_rows, desc=f"Processing {table_name}")
-    csv_file_name = f"{table_name}.csv"
-    logging.info(f"Creating CSV from table {table_name}")
-    with open(csv_file_name, "w") as f:
-        csv_writer = csv.writer(f)
-        while True:
-            cursor.execute(f"SELECT * FROM {schema_name}.{table_name} LIMIT {batch_size} OFFSET {offset}")
-            rows = cursor.fetchall()
-            if not rows:
-                break
-            if offset == 0:
-                csv_writer.writerow([desc[0] for desc in cursor.description])  # header
-            csv_writer.writerows(rows)
-            pbar.update(len(rows))
-            offset += batch_size
-    pbar.close()
-    return csv_file_name
+    num_shards = total_rows // max_rows_per_shard + (1 if total_rows % max_rows_per_shard != 0 else 0)
+    for shard_num in range(1, num_shards + 1):
+        offset = (shard_num - 1) * max_rows_per_shard
+        shard_pbar = tqdm(total=min(max_rows_per_shard, total_rows - offset), desc=f"Processing {table_name} (shard {shard_num})")
+        
+        csv_file_name = f"{table_name}_shard_{shard_num}.csv"
+        generated_files.append(csv_file_name)
+        logging.info(f"Creating CSV from table {table_name}, shard {shard_num}")
+        
+        with open(csv_file_name, "w") as f:
+            csv_writer = csv.writer(f)
+            while True:
+                cursor.execute(f"SELECT * FROM {schema_name}.{table_name} LIMIT {batch_size} OFFSET {offset}")
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+                if offset == (shard_num - 1) * max_rows_per_shard:  # first batch of the shard
+                    csv_writer.writerow([desc[0] for desc in cursor.description])  # header
+                csv_writer.writerows(rows)
+                shard_pbar.update(len(rows))
+                offset += batch_size
+        shard_pbar.close()
+    
+    return generated_files
 
 
 class ThreadedConnection(object):
@@ -172,29 +180,28 @@ def postgres_to_csv(schema_name, batch_size=1000):
         pbar = tqdm(total=total_tables, desc="Exporting tables")
         for i, table in enumerate(tables):
             table_name = table[0]
-            csv_file_name_to_check = f"{table_name}.csv"
-
-            if check_file_exists_in_s3(bucket_name, csv_file_name_to_check, schema_name):
-                logging.info(f"Skipping {table_name}, already uploaded to S3.")
-                continue
             try:
-                csv_file_name = table_to_csv(cursor, schema_name, table_name, batch_size)
-                full_csv_path = os.path.join(output_folder, csv_file_name)
-                os.rename(csv_file_name, full_csv_path)
-                if upload_file_to_s3(full_csv_path, bucket_name):
-                    if os.path.exists(full_csv_path):
-                        os.remove(full_csv_path)
-                    else:
-                        logging.warning(f"{csv_file_name} does not exist on the local filesystem.")
+                generated_files = table_to_csv(cursor, schema_name, table_name, batch_size)
+                for csv_file_name in generated_files:
+                    csv_file_name_to_check = csv_file_name  # Update this if needed
+
+                    if check_file_exists_in_s3(bucket_name, csv_file_name_to_check, schema_name):
+                        logging.info(f"Skipping {csv_file_name}, already uploaded to S3.")
+                        continue
+
+                    full_csv_path = os.path.join(output_folder, csv_file_name)
+                    os.rename(csv_file_name, full_csv_path)
+
+                    if upload_file_to_s3(full_csv_path, bucket_name):
+                        if os.path.exists(full_csv_path):
+                            os.remove(full_csv_path)
+                        else:
+                            logging.warning(f"{csv_file_name} does not exist on the local filesystem.")
+
                 logging.info(f"Progress: {i + 1}/{total_tables} tables exported.")
             except Exception as e:
                 logging.error(f"Failed to export table {table_name}. Error: {e}")
-                full_csv_path = os.path.join(output_folder, csv_file_name)
-                if os.path.exists(full_csv_path):
-                    os.remove(full_csv_path)
-                else:
-                    logging.warning(f"{full_csv_path} does not exist on the local filesystem.")
-                pbar.update(1)
+            pbar.update(1)
         pbar.close()
 
         logging.info("All tables exported.")
@@ -206,10 +213,11 @@ if __name__ == "__main__":
 
     # postgres_to_csv('county_deeds_public')
     # postgres_to_csv('greatcontrol')
-    # postgres_to_csv('latchel')
     # postgres_to_csv('zendesk')
     # postgres_to_csv('rent_manager')
 
+    # remove_all_csv_files('latchel')
+    # postgres_to_csv('latchel')
     # remove_all_csv_files('rently')
     # postgres_to_csv('rently')
     # remove_all_csv_files('meld')

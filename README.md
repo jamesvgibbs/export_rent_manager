@@ -6,7 +6,7 @@ How many times have you struggled to export data and store in someplace for safe
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/nedivo/nedivo-ui.git
+git clone https://github.com/jamesvgibbs/export_rent_manager.git
 ```
 
 2. Change to the project directory:
